@@ -485,12 +485,10 @@ function simplifyCompanyName(name: string): string[] {
 }
 
 async function fetchRedditSearch(query: string): Promise<RedditMention[]> {
-  const endpoint = `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&limit=5&sort=relevance`;
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://offer-safe.vercel.app";
+  const endpoint = `${baseUrl}/api/reddit?q=${encodeURIComponent(query)}`;
   try {
     const res = await fetch(endpoint, {
-      headers: {
-        "User-Agent": "OfferSafe/1.0 (community risk analysis)",
-      },
       cache: "no-store",
     });
 
@@ -838,11 +836,11 @@ export async function POST(req: Request) {
       addSignal("paid_training_placement", "Contains paid training/guaranteed placement language.");
     }
 
-    if (websiteDomain) {
-      addSignal("domain_age_new", "Domain age could not be independently verified.");
-    } else {
+    if (!websiteDomain) {
       addSignal("domain_missing", "No website URL provided.");
     }
+    // domain_age_new removed — it fired for every site and inflated all scores
+    
 
     const stipend = extractedEntities.stipendAmount;
     const isInternship = /(intern|internship)/i.test(`${input.jobTitle} ${fullText}`);
@@ -862,15 +860,17 @@ export async function POST(req: Request) {
       addSignal("no_company_web_presence", "No website and no LinkedIn profile provided.");
     }
 
-    if (fullText && !containsAny(fullText, INTERVIEW_KEYWORDS)) {
-      addSignal("no_interview_mentioned", "No interview/test/assessment mentions in submitted text.");
+    const offerTextWordCount = fullText.trim().split(/\s+/).filter(Boolean).length;
+    if (offerTextWordCount > 50 && !containsAny(fullText, INTERVIEW_KEYWORDS)) {
+    addSignal("no_interview_mentioned", "No interview/test/assessment mentions in submitted text.");
+
     }
 
     if (/whatsapp/i.test(`${input.phone} ${fullText}`)) {
       addSignal("whatsapp_only_recruitment", "WhatsApp appears to be primary/only recruitment channel.");
     }
 
-    if (fullText) {
+    if (fullText && fullText.trim().split(/\s+/).filter(Boolean).length > 80) {
       const checks = [
         /(company address|address:)/i.test(fullText),
         /(registration number|cin|incorporation no)/i.test(fullText),
@@ -887,7 +887,7 @@ export async function POST(req: Request) {
     const titleWordCount = (input.jobTitle || "").split(/\s+/).filter(Boolean).length;
     const roleWordCount = (input.roleDescription || "").split(/\s+/).filter(Boolean).length;
 
-    if (titleWordCount > 0 && titleWordCount < 3 && roleWordCount < 30) {
+    if (titleWordCount > 0 && titleWordCount < 3 && roleWordCount > 0 && roleWordCount < 30)  {
       addSignal("vague_role", "Job title and role details are too vague.");
     }
 
