@@ -255,13 +255,17 @@ function extractStipendAmount(text: string): number | null {
 function parseJsonObject(raw: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
   } catch {
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return null;
     try {
       const parsed = JSON.parse(match[0]);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
     } catch {
       return null;
     }
@@ -439,6 +443,47 @@ function commentHasScamKeyword(body: string): boolean {
   return containsAny(body, REDDIT_COMMENT_KEYWORDS);
 }
 
+function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+
+  for (const value of values) {
+    const v = toText(value);
+    if (!v) continue;
+    const key = lower(v);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(v);
+    }
+  }
+
+  return out;
+}
+
+function simplifyCompanyName(name: string): string[] {
+  const raw = toText(name);
+  if (!raw) return [];
+
+  const cleaned = raw
+    .replace(
+      /\b(private limited|pvt\.?\s*ltd\.?|limited|ltd\.?|llp|inc\.?|technologies|technology|solutions|fintech)\b/gi,
+      " ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const parts = cleaned.split(" ").filter(Boolean);
+
+  const variants = [
+    raw,
+    cleaned,
+    parts.slice(0, 1).join(" "),
+    parts.slice(0, 2).join(" "),
+  ];
+
+  return uniqueNonEmpty(variants);
+}
+
 async function fetchRedditSearch(query: string): Promise<RedditMention[]> {
   const endpoint = `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&limit=5&sort=relevance`;
   try {
@@ -448,37 +493,78 @@ async function fetchRedditSearch(query: string): Promise<RedditMention[]> {
       },
       cache: "no-store",
     });
+
     if (!res.ok) return [];
+
     const payload = (await res.json()) as {
       data?: { children?: Array<{ data?: unknown }> };
     };
+
     const children = payload.data?.children || [];
     const mentions: RedditMention[] = [];
+
     for (const child of children) {
       const normalized = normalizeRedditMention(child.data);
       if (normalized) mentions.push(normalized);
     }
+
     return mentions;
   } catch {
     return [];
   }
 }
 
-async function fetchRedditMentions(companyName: string): Promise<RedditMention[]> {
-  const cleanCompany = companyName.trim();
-  if (!cleanCompany) return [];
-  const queries = [
-    `${cleanCompany} scam`,
-    ...REDDIT_SUBREDDITS.map((sub) => `${cleanCompany} scam subreddit:${sub}`),
-  ];
-  const settled = await Promise.all(queries.map((q) => fetchRedditSearch(q)));
-  const merged = new Map<string, RedditMention>();
-  for (const items of settled) {
-    for (const item of items) {
-      if (!merged.has(item.id)) merged.set(item.id, item);
+async function fetchRedditSearchWithRetry(query: string, retries = 3): Promise<RedditMention[]> {
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    const result = await fetchRedditSearch(query);
+    if (result.length > 0) return result;
+    if (attempt < retries) {
+      await delay(700 * attempt);
     }
   }
-  return [...merged.values()];
+  return [];
+}
+
+function buildRedditQueries(companyNames: string[]): string[] {
+  const queries: string[] = [];
+
+  for (const company of companyNames) {
+    queries.push(
+      `${company}`,
+      `${company} scam`,
+      `${company} internship scam`,
+      `${company} job scam`,
+      `${company} fake offer`,
+      `${company} fraud`,
+    );
+
+    for (const sub of REDDIT_SUBREDDITS) {
+      queries.push(
+        `${company} scam subreddit:${sub}`,
+        `${company} internship subreddit:${sub}`,
+      );
+    }
+  }
+
+  return uniqueNonEmpty(queries);
+}
+
+async function fetchRedditMentions(companyNames: string[]): Promise<RedditMention[]> {
+  const queries = buildRedditQueries(companyNames);
+  if (queries.length === 0) return [];
+
+  const settled = await Promise.all(queries.map((q) => fetchRedditSearchWithRetry(q)));
+  const merged = new Map<string, RedditMention>();
+
+  for (const items of settled) {
+    for (const item of items) {
+      if (!merged.has(item.id)) {
+        merged.set(item.id, item);
+      }
+    }
+  }
+
+  return [...merged.values()].sort((a, b) => b.score - a.score);
 }
 
 async function fetchPostComments(post: RedditMention): Promise<RedditComment[]> {
@@ -490,26 +576,32 @@ async function fetchPostComments(post: RedditMention): Promise<RedditComment[]> 
       },
       cache: "no-store",
     });
+
     if (!res.ok) return [];
+
     const payload = (await res.json()) as Array<{
       data?: { children?: Array<{ data?: unknown }> };
     }>;
+
     const commentListing = payload?.[1]?.data?.children || [];
     const comments: RedditComment[] = [];
+
     for (const child of commentListing) {
       const normalized = normalizeRedditComment(child.data);
       if (normalized) comments.push(normalized);
     }
+
     return comments.slice(0, 10);
   } catch {
     return [];
   }
 }
 
-async function fetchRedditMentionsWithComments(companyName: string): Promise<RedditMentionsPayload> {
-  const posts = await fetchRedditMentions(companyName);
+async function fetchRedditMentionsWithComments(companyNames: string[]): Promise<RedditMentionsPayload> {
+  const posts = await fetchRedditMentions(companyNames);
   const comments: Record<string, RedditComment[]> = {};
-  const topPosts = [...posts].sort((a, b) => b.score - a.score).slice(0, 3);
+  const topPosts = [...posts].slice(0, 5);
+
   for (let i = 0; i < topPosts.length; i += 1) {
     const post = topPosts[i];
     comments[post.id] = await fetchPostComments(post);
@@ -517,12 +609,14 @@ async function fetchRedditMentionsWithComments(companyName: string): Promise<Red
       await delay(500);
     }
   }
+
   return { posts, comments };
 }
 
 async function supabaseRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
   if (!url || !anon) {
     throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
   }
@@ -551,6 +645,7 @@ async function callGroqForExplanations(
   triggeredSignals: TriggeredSignal[],
 ): Promise<{ signalExplanations: Record<string, string>; nextSteps: string[] }> {
   const apiKey = process.env.GROQ_API_KEY;
+
   if (!apiKey || triggeredSignals.length === 0) {
     return {
       signalExplanations: Object.fromEntries(
@@ -594,8 +689,8 @@ async function callGroqForExplanations(
 
 export async function POST(req: Request) {
   try {
-    // Step 0: Parse input
     const body = (await req.json()) as AnalyzePayload;
+
     const input: AnalyzePayload = {
       companyName: toText(body.companyName),
       recruiterName: toText(body.recruiterName),
@@ -612,6 +707,7 @@ export async function POST(req: Request) {
     };
 
     const fullText = [input.offerText, input.paymentText, input.extractedText].filter(Boolean).join("\n");
+
     const fullSubmittedText = [
       `Company Name: ${input.companyName || ""}`,
       `Recruiter Name: ${input.recruiterName || ""}`,
@@ -627,24 +723,25 @@ export async function POST(req: Request) {
       `Extracted Text: ${input.extractedText || ""}`,
     ].join("\n");
 
-    // Step 1 — Entity extraction
     const extractedEntities = await extractEntitiesWithGemini(input, fullSubmittedText);
     const emailDomain = extractedEntities.emailDomain || extractEmailDomain(input.recruiterEmail || "");
     const websiteDomain = extractedEntities.websiteDomain || extractDomain(input.website || "");
 
-    // Step 2 — Scam case matching
     const scamCases = await supabaseRequest<ScamCase[]>("scam_cases?status=eq.approved&select=*");
 
     let matchedCase: ScamCase | null = null;
     const companyInput = lower(extractedEntities.companyName || input.companyName || "");
+
     for (const c of scamCases) {
       const companyHit = (c.company_name_variants || []).some((v) => {
         const vv = lower(v || "");
         return vv.length > 0 && companyInput.length > 0 && (companyInput.includes(vv) || vv.includes(companyInput));
       });
+
       const emailHit = (c.email_patterns || []).some(
         (p) => p && input.recruiterEmail && lower(input.recruiterEmail).includes(lower(p)),
       );
+
       const domainHit = (c.domain_patterns || []).some((p) => {
         if (!p || !websiteDomain) return false;
         const candidate = lower(p);
@@ -657,14 +754,22 @@ export async function POST(req: Request) {
       }
     }
 
-    const redditMentionsData = await fetchRedditMentionsWithComments(extractedEntities.companyName || input.companyName || "");
-    const strongRedditMentions = redditMentionsData.posts.filter((item) => item.score > 5);
+    const redditCompanyNames = uniqueNonEmpty([
+      extractedEntities.companyName,
+      input.companyName,
+      matchedCase?.case_name,
+      ...(matchedCase?.company_name_variants || []),
+      ...simplifyCompanyName(extractedEntities.companyName || input.companyName || ""),
+    ]);
+
+    const redditMentionsData = await fetchRedditMentionsWithComments(redditCompanyNames);
+    const strongRedditMentions = redditMentionsData.posts.filter((item) => item.score >= 1);
     const scamKeywordCommentCount = Object.values(redditMentionsData.comments)
       .flat()
       .filter((comment) => commentHasScamKeyword(comment.body)).length;
 
-    // Step 3 — Signal engine (fixed hardcoded weights only)
     const triggered: TriggeredSignal[] = [];
+
     const addSignal = (key: SignalKey, reason: string) => {
       const exists = triggered.some((s) => s.key === key);
       if (!exists) {
@@ -676,6 +781,7 @@ export async function POST(req: Request) {
         });
       }
     };
+
     const addCustomSignal = (key: SignalKey, reason: string, weight: number, severity: SignalSeverity) => {
       const exists = triggered.some((s) => s.key === key);
       if (!exists) {
@@ -688,7 +794,9 @@ export async function POST(req: Request) {
       }
     };
 
-    if (matchedCase) addSignal("known_scam_match", `Matched known scam case: ${matchedCase.case_name}`);
+    if (matchedCase) {
+      addSignal("known_scam_match", `Matched known scam case: ${matchedCase.case_name}`);
+    }
 
     if (emailDomain && FREE_EMAIL_DOMAINS.has(emailDomain)) {
       addSignal("email_free_provider", `Recruiter email uses free provider (${emailDomain}).`);
@@ -699,14 +807,18 @@ export async function POST(req: Request) {
     }
 
     const cinValue = extractedEntities.cin || input.cin || "";
+
     if (cinValue) {
-      if (!CIN_REGEX.test(cinValue)) addSignal("cin_invalid_format", "CIN provided but format is invalid.");
+      if (!CIN_REGEX.test(cinValue)) {
+        addSignal("cin_invalid_format", "CIN provided but format is invalid.");
+      }
     } else {
       addSignal("cin_missing", "No CIN provided.");
     }
 
     const registeredClaim =
       Boolean(cinValue) || /(registered|pvt ltd|private limited|llp|inc)/i.test(`${input.companyName} ${fullText}`);
+
     if (registeredClaim && emailDomain && (emailDomain === "gmail.com" || emailDomain === "yahoo.com")) {
       addSignal("gmail_as_official", "Registered company claim with gmail/yahoo official contact.");
     }
@@ -717,6 +829,7 @@ export async function POST(req: Request) {
 
     const reimbursementTrap =
       /(reimburse after joining|will be reimbursed)/i.test(fullText) && /(purchase|buy)/i.test(fullText);
+
     if (reimbursementTrap) {
       addSignal("reimbursement_trap", "Contains reimbursement-after-joining plus purchase/buy language.");
     }
@@ -726,7 +839,6 @@ export async function POST(req: Request) {
     }
 
     if (websiteDomain) {
-      // Live domain-age verification is intentionally not implemented.
       addSignal("domain_age_new", "Domain age could not be independently verified.");
     } else {
       addSignal("domain_missing", "No website URL provided.");
@@ -735,6 +847,7 @@ export async function POST(req: Request) {
     const stipend = extractedEntities.stipendAmount;
     const isInternship = /(intern|internship)/i.test(`${input.jobTitle} ${fullText}`);
     const isFresher = /(fresher|entry level|graduate)/i.test(`${input.jobTitle} ${fullText}`);
+
     if (stipend !== null) {
       if ((isInternship && stipend > 80000) || (isFresher && stipend > 200000)) {
         addSignal("unrealistic_stipend", "Stipend appears unrealistically high for role category.");
@@ -773,17 +886,19 @@ export async function POST(req: Request) {
 
     const titleWordCount = (input.jobTitle || "").split(/\s+/).filter(Boolean).length;
     const roleWordCount = (input.roleDescription || "").split(/\s+/).filter(Boolean).length;
+
     if (titleWordCount > 0 && titleWordCount < 3 && roleWordCount < 30) {
       addSignal("vague_role", "Job title and role details are too vague.");
     }
 
-    if (strongRedditMentions.length >= 3) {
+    if (strongRedditMentions.length >= 2) {
       addSignal(
         "reddit_mentions",
-        `${strongRedditMentions.length} community Reddit posts with meaningful upvotes mention scam concerns for this company.`,
+        `${strongRedditMentions.length} Reddit posts mention scam or hiring concerns related to this company.`,
       );
     }
-    if (scamKeywordCommentCount >= 3) {
+
+    if (scamKeywordCommentCount >= 2) {
       addCustomSignal(
         "reddit_comment_scam_score",
         `${scamKeywordCommentCount} Reddit comments include scam-related warnings from the community.`,
@@ -804,10 +919,8 @@ export async function POST(req: Request) {
     const verdict = verdictFromScore(riskScore);
     const confidence = confidenceFromFilledFields(input);
 
-    // Step 4 — Groq API call (only explanations + next steps)
     const llmOutput = await callGroqForExplanations(triggered);
 
-    // Step 5 — Save case and return id
     const insertPayload = {
       inputs_json: input,
       extracted_entities_json: {
@@ -842,6 +955,7 @@ export async function POST(req: Request) {
     });
 
     const id = inserted?.[0]?.id;
+
     if (!id) {
       throw new Error("Failed to persist case id.");
     }
