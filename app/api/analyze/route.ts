@@ -512,7 +512,7 @@ async function fetchRedditSearch(query: string): Promise<RedditMention[]> {
   }
 }
 
-async function fetchRedditSearchWithRetry(query: string, retries = 3): Promise<RedditMention[]> {
+async function fetchRedditSearchWithRetry(query: string, retries = 1): Promise<RedditMention[]> {
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     const result = await fetchRedditSearch(query);
     if (result.length > 0) return result;
@@ -525,25 +525,12 @@ async function fetchRedditSearchWithRetry(query: string, retries = 3): Promise<R
 
 function buildRedditQueries(companyNames: string[]): string[] {
   const queries: string[] = [];
-
-  for (const company of companyNames) {
+  for (const company of companyNames.slice(0, 2)) {
     queries.push(
-      `${company}`,
       `${company} scam`,
-      `${company} internship scam`,
-      `${company} job scam`,
-      `${company} fake offer`,
-      `${company} fraud`,
+      `${company} job fraud`,
     );
-
-    for (const sub of REDDIT_SUBREDDITS) {
-      queries.push(
-        `${company} scam subreddit:${sub}`,
-        `${company} internship subreddit:${sub}`,
-      );
-    }
   }
-
   return uniqueNonEmpty(queries);
 }
 
@@ -566,12 +553,10 @@ async function fetchRedditMentions(companyNames: string[]): Promise<RedditMentio
 }
 
 async function fetchPostComments(post: RedditMention): Promise<RedditComment[]> {
-  const endpoint = `https://www.reddit.com/r/${encodeURIComponent(post.subreddit)}/comments/${encodeURIComponent(post.id)}.json?sort=top&limit=10`;
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://offer-safe.vercel.app";
+  const endpoint = `${baseUrl}/api/reddit?q=${encodeURIComponent(post.title)}&type=comments&id=${encodeURIComponent(post.id)}&subreddit=${encodeURIComponent(post.subreddit)}`;
   try {
     const res = await fetch(endpoint, {
-      headers: {
-        "User-Agent": "OfferSafe/1.0 (community risk analysis)",
-      },
       cache: "no-store",
     });
 
